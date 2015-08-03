@@ -31,4 +31,4 @@
 # Debug files
 *.dSYM/
 
-/opencl_experiments
+/build/
