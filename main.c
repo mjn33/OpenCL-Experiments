@@ -12,19 +12,44 @@
 
 #include <CL/cl.h>
 
+typedef void (*debug_print_handler)(const char *, cl_int, const char *);
+
+debug_print_handler g_debug_print_handler = NULL;
+
+void init_debug_print_handler(debug_print_handler func)
+{
+    g_debug_print_handler = func;
+}
+
 static void debug_printf(const char *fmt,
                          const char *filename,
                          int line,
                          ...)
 {
-    va_list args;
+    char buf[4096];
+    char *heap_buf;
+    size_t len;
+    va_list ap;
 
-    fprintf(stderr, "%s:%d: ", filename, line);
-    va_start (args, line);
-    vfprintf (stderr, fmt, args);
-    va_end (args);
+    va_start (ap, line);
+    len = vsnprintf(buf, 4096, fmt, ap);
+    va_end(ap);
+    if (len > 4095) {
+        /* Large output, allocate heap buffer */
+        heap_buf = malloc(sizeof(*heap_buf) * (len + 1));
+        if (!heap_buf)
+            g_debug_print_handler(filename, line, buf); /* Bail */
+        else {
+            va_start (ap, line);
+            len = vsnprintf(heap_buf, len + 1, fmt, ap);
+            va_end(ap);
 
-    fprintf(stderr, "\n");
+            g_debug_print_handler(filename, line, heap_buf);
+        }
+        free(heap_buf);
+    }
+    else
+        g_debug_print_handler(filename, line, buf);
 }
 
 #define CHECK_CL_ERROR(err)                                             \
@@ -34,7 +59,7 @@ static void debug_printf(const char *fmt,
                          __FILE__, __LINE__, err);                      \
             goto error;                                                 \
         }                                                               \
-    } while(1)
+    } while(0)
 
 #define CHECK_CL_ERROR_MSG(err, fmt, ...)                               \
     do {                                                                \
@@ -43,7 +68,7 @@ static void debug_printf(const char *fmt,
                          __FILE__, __LINE__, __VA_ARGS__, err);         \
             goto error;                                                 \
         }                                                               \
-    } while(1)
+    } while(0)
 
 #define CHECK_ALLOCATION(ptr)                                           \
     do {                                                                \
@@ -52,7 +77,19 @@ static void debug_printf(const char *fmt,
                          __FILE__, __LINE__);                           \
             goto error;                                                 \
         }                                                               \
-    } while(1)
+    } while(0)
+
+#define TRACE(fmt, ...)                                                 \
+    do {                                                                \
+        debug_printf("Trace: " fmt, __FILE__, __LINE__,                 \
+                         __VA_ARGS__);                                  \
+    } while(0)
+
+#define WARNING(fmt, ...)                                               \
+    do {                                                                \
+        debug_printf("Warning: " fmt, __FILE__, __LINE__,               \
+                         __VA_ARGS__);                                  \
+    } while(0)
 
 typedef struct _opencl_plugin
 {
@@ -309,37 +346,53 @@ cl_int opencl_plugin_create(opencl_plugin *plugin_out)
     plugin = calloc(1, sizeof(*plugin));
     CHECK_ALLOCATION(plugin);
 
+    TRACE("Trace %d", 1);
+
     if (get_desired_platform("NVIDIA", &plugin->selected_platform, &err))
         goto error;
+
+    TRACE("Trace %d", 2);
 
     if (get_gpu_device_id(plugin->selected_platform, &plugin->selected_device,
                           CL_TRUE, &err))
         goto error;
 
+    TRACE("Trace %d", 3);
+
     if (create_context(plugin->selected_platform, plugin->selected_device,
                        &plugin->context, &err))
         goto error;
+
+    TRACE("Trace %d", 4);
 
     if (build_program_from_file("program.cl", NULL, plugin->context,
                                 plugin->selected_device, &plugin->program, &err))
         goto error;
 
+    TRACE("Trace %d", 5);
+
     plugin->queue = clCreateCommandQueue(plugin->context, plugin->selected_device, 0, &err);
     CHECK_CL_ERROR(err);
+
+    TRACE("Trace %d", 6);
 
     plugin->voxelize_kernel = clCreateKernel(plugin->program, "voxelize", &err);
     CHECK_CL_ERROR(err);
 
+    TRACE("Trace %d", 7);
+
     *plugin_out = plugin;
     return 0;
 error:
-    if (plugin->voxelize_kernel)
-        clReleaseKernel(plugin->voxelize_kernel);
-    if (plugin->queue)
-        clReleaseCommandQueue(plugin->queue);
-    if (plugin->context)
-        clReleaseContext(plugin->context);
-    free(plugin);
+    if (plugin) {
+        if (plugin->voxelize_kernel)
+            clReleaseKernel(plugin->voxelize_kernel);
+        if (plugin->queue)
+            clReleaseCommandQueue(plugin->queue);
+        if (plugin->context)
+            clReleaseContext(plugin->context);
+        free(plugin);
+    }
     return -1;
 }
 
@@ -379,25 +432,59 @@ static cl_int opencl_plugin_init_buffers(opencl_plugin plugin,
     for (i = 0; i < mesh_data_count; i++)
         total_num_triangles += mesh_data_list[i].num_triangles;
 
-    if (total_num_triangles <= plugin->mesh_buffers_max_triangles)
-        return 0;
+    if (total_num_triangles > plugin->mesh_buffers_max_triangles) {
+        /* Current buffer not big enough, free old buffers first */
+        if (plugin->vertex_buffer) {
+            clReleaseMemObject(plugin->vertex_buffer);
+            plugin->vertex_buffer = NULL;
+        }
+        if (plugin->triangles_buffer) {
+            clReleaseMemObject(plugin->triangles_buffer);
+            plugin->triangles_buffer = NULL;
+        }
 
-    /* TODO: Maybe do other way around? */
-    /* TODO: Maybe better dynamic resizing (factor = 1.5)? */
-    new_vertex_buffer =
+        plugin->mesh_buffers_max_triangles = 0;
+
+        /* TODO: Maybe better dynamic resizing (factor = 1.5)? */
+        new_vertex_buffer =
         clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
                        sizeof(cl_int) * total_num_triangles, NULL, &err);
-    CHECK_CL_ERROR(err);
+        CHECK_CL_ERROR(err);
 
-    new_triangles_buffer =
-        clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
-                       sizeof(float) * 3 * total_num_triangles, NULL, &err);
-    CHECK_CL_ERROR(err);
+        new_triangles_buffer =
+            clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
+                           sizeof(float) * 3 * total_num_triangles, NULL, &err);
+        CHECK_CL_ERROR(err);
 
-    if (plugin->vertex_buffer)
-        clReleaseMemObject(plugin->vertex_buffer);
-    if (plugin->triangles_buffer)
-        clReleaseMemObject(plugin->triangles_buffer);
+        plugin->mesh_buffers_max_triangles = total_num_triangles;
+        plugin->vertex_buffer = new_vertex_buffer;
+        plugin->triangles_buffer = new_triangles_buffer;
+        new_vertex_buffer = new_triangles_buffer = NULL;
+    }
+
+    total_num_triangles = 0;
+    for (i = 0; i < mesh_data_count; i++) {
+        mesh_data *mesh_data = &mesh_data_list[i];
+
+        err = clEnqueueWriteBuffer(
+            plugin->queue, new_vertex_buffer, CL_FALSE,
+            total_num_triangles * sizeof(float) * 3,
+            mesh_data->num_triangles * sizeof(float) * 3, mesh_data->verticies,
+            0, NULL, NULL);
+        CHECK_CL_ERROR(err);
+
+        err = clEnqueueWriteBuffer(
+            plugin->queue, new_triangles_buffer, CL_FALSE,
+            total_num_triangles * sizeof(cl_int),
+            mesh_data->num_triangles * sizeof(cl_int), mesh_data->triangles,
+            0, NULL, NULL);
+        CHECK_CL_ERROR(err);
+
+        total_num_triangles += mesh_data_list[i].num_triangles;
+    }
+
+    /* Wait for all buffer writes to finish, TODO: investigate this further */
+    clFinish(plugin->queue);
 
     return 0;
 error:
@@ -417,9 +504,9 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
                                      cl_int y_cell_length,
                                      cl_int z_cell_length,
                                      cl_int mesh_data_count,
-                                     mesh_data *mesh_data_list)
+                                     mesh_data *mesh_data_list,
+                                     cl_uchar *voxel_grid_out)
 {
-    /* TODO: check buffer */
     cl_int err = CL_SUCCESS;
     cl_int i;
     cl_int next_row_offset, next_slice_offset;
@@ -478,6 +565,11 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
         CHECK_CL_ERROR(err);
     }
 
+    err = clEnqueueReadBuffer(
+        plugin->queue, plugin->voxel_grid_buffer, CL_TRUE, 0,
+        plugin->voxel_grid_buffer_size, voxel_grid_out, 0, NULL, NULL);
+    CHECK_CL_ERROR(err);
+
     return 0;
 error:
     return -1;
@@ -493,5 +585,12 @@ void opencl_plugin_destroy(opencl_plugin plugin)
         clReleaseCommandQueue(plugin->queue);
     if (plugin->context)
         clReleaseContext(plugin->context);
+    if (plugin->voxel_grid_buffer)
+        clReleaseMemObject(plugin->voxel_grid_buffer);
+    if (plugin->vertex_buffer)
+        clReleaseMemObject(plugin->vertex_buffer);
+    if (plugin->triangles_buffer)
+        clReleaseMemObject(plugin->triangles_buffer);
+
     free(plugin);
 }
