@@ -82,13 +82,19 @@ static void debug_printf(const char *fmt,
 #define TRACE(fmt, ...)                                                 \
     do {                                                                \
         debug_printf("Trace: " fmt, __FILE__, __LINE__,                 \
-                         __VA_ARGS__);                                  \
+                     __VA_ARGS__);                                      \
     } while(0)
 
 #define WARNING(fmt, ...)                                               \
     do {                                                                \
         debug_printf("Warning: " fmt, __FILE__, __LINE__,               \
-                         __VA_ARGS__);                                  \
+                     __VA_ARGS__);                                      \
+    } while(0)
+
+#define ERROR(fmt, ...)                                                 \
+    do {                                                                \
+        debug_printf("Error: " fmt, __FILE__, __LINE__,                 \
+                     __VA_ARGS__);                                      \
     } while(0)
 
 typedef struct _opencl_plugin
@@ -104,16 +110,19 @@ typedef struct _opencl_plugin
     size_t           voxel_grid_buffer_size;
 
     cl_mem           vertex_buffer;
-    cl_mem           triangles_buffer;
-    size_t           mesh_buffers_max_triangles;
+    cl_mem           triangle_buffer;
+    size_t           vertex_buffer_capacity;
+    size_t           triangle_buffer_capacity;
 } *opencl_plugin;
 
 typedef struct _mesh_data
 {
-    float  *verticies;
+    float  *vertices;
+    cl_int num_vertices;
     cl_int *triangles;
     cl_int num_triangles;
-    size_t buffer_offset;
+    size_t triangle_buffer_base_idx;
+    size_t vertex_buffer_base_idx;
 } mesh_data;
 
 static int get_desired_platform(const char *substr,
@@ -189,7 +198,7 @@ static int get_gpu_device_id(cl_platform_id platform_id,
     *err = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_GPU, 1, device_out,
                           NULL);
     if (*err == CL_DEVICE_NOT_FOUND && !fallback) {
-        fprintf(stderr, "Error: No GPU devices found\n");
+        ERROR("No GPU devices found", 0);
         goto error;
     }
     else if (*err != CL_DEVICE_NOT_FOUND) {
@@ -200,7 +209,7 @@ static int get_gpu_device_id(cl_platform_id platform_id,
     *err = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_DEFAULT, 1,
                           device_out, NULL);
     if (*err == CL_DEVICE_NOT_FOUND) {
-        fprintf(stderr, "Error: No devices found\n");
+        ERROR("No devices found", 0);
         goto error;
     }
     CHECK_CL_ERROR(*err);
@@ -252,17 +261,17 @@ static int build_program_from_file(const char *filename,
 
     file = fopen(filename, "r");
     if (!file) {
-        fprintf(stderr, "Error: Couldn't open file \"%s\"\n", filename);
+        ERROR("Couldn't open file \"%s\"", filename);
         goto error;
     }
 
     if (fseek(file, 0L, SEEK_END)) {
-        fprintf(stderr, "Error: cannot determine file size of \"%s\"\n", filename);
+        ERROR("Cannot determine file size of \"%s\"", filename);
         goto error;
     }
     program_source_size = ftell(file);
     if (fseek(file, 0L, SEEK_SET)) {
-        fprintf(stderr, "Error: cannot determine file size of \"%s\"\n", filename);
+        ERROR("Cannot determine file size of \"%s\"", filename);
         goto error;
     }
 
@@ -270,7 +279,7 @@ static int build_program_from_file(const char *filename,
     CHECK_ALLOCATION(program_source);
 
     if (fread(program_source, 1, program_source_size, file) != program_source_size) {
-        fprintf(stderr, "Error: failed to read file \"%s\"\n", filename);
+        ERROR("Failed to read file \"%s\"", filename);
         goto error;
     }
     program_source[program_source_size] = '\0';
@@ -293,11 +302,13 @@ static int build_program_from_file(const char *filename,
         *err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, build_log_size, build_log, NULL);
         CHECK_CL_ERROR(*err);
 
-        fprintf(stderr, "Error: Failed to build program in file %s\n", filename);
         if (options)
-            fprintf(stderr, "       with options \"%s\"\n\n", options);
-        fprintf(stderr, "================================== BUILD LOG ===================================\n\n");
-        fprintf(stderr, "%s", build_log);
+            ERROR("Failed to build program in file \"%s\" with options \"%s\"", filename, options);
+        else
+            ERROR("Failed to build program in file \"%s\"", filename);
+
+        debug_printf("================================== BUILD LOG ===================================", NULL, 0);
+        debug_printf("%s", NULL, 0, build_log);
         goto error;
     }
     CHECK_CL_ERROR(*err);
@@ -346,40 +357,26 @@ cl_int opencl_plugin_create(opencl_plugin *plugin_out)
     plugin = calloc(1, sizeof(*plugin));
     CHECK_ALLOCATION(plugin);
 
-    TRACE("Trace %d", 1);
-
     if (get_desired_platform("NVIDIA", &plugin->selected_platform, &err))
         goto error;
-
-    TRACE("Trace %d", 2);
 
     if (get_gpu_device_id(plugin->selected_platform, &plugin->selected_device,
                           CL_TRUE, &err))
         goto error;
 
-    TRACE("Trace %d", 3);
-
     if (create_context(plugin->selected_platform, plugin->selected_device,
                        &plugin->context, &err))
         goto error;
-
-    TRACE("Trace %d", 4);
 
     if (build_program_from_file("program.cl", NULL, plugin->context,
                                 plugin->selected_device, &plugin->program, &err))
         goto error;
 
-    TRACE("Trace %d", 5);
-
     plugin->queue = clCreateCommandQueue(plugin->context, plugin->selected_device, 0, &err);
     CHECK_CL_ERROR(err);
 
-    TRACE("Trace %d", 6);
-
     plugin->voxelize_kernel = clCreateKernel(plugin->program, "voxelize", &err);
     CHECK_CL_ERROR(err);
-
-    TRACE("Trace %d", 7);
 
     *plugin_out = plugin;
     return 0;
@@ -401,6 +398,8 @@ cl_int opencl_plugin_set_num_voxels(opencl_plugin plugin,
 {
     cl_int err;
     cl_mem buffer = NULL;
+
+    assert(plugin != NULL);
 
     /* TODO: Maybe do other way around? */
     buffer = clCreateBuffer(plugin->context, CL_MEM_WRITE_ONLY, (size_t)num_voxels, NULL, &err);
@@ -426,72 +425,91 @@ static cl_int opencl_plugin_init_buffers(opencl_plugin plugin,
 {
     cl_int err;
     cl_int i;
-    cl_mem new_vertex_buffer = NULL, new_triangles_buffer = NULL;
-    size_t total_num_triangles = 0;
+    cl_mem new_vertex_buffer = NULL, new_triangle_buffer = NULL;
+    size_t total_num_vertices = 0, total_num_triangles = 0;
 
-    for (i = 0; i < mesh_data_count; i++)
+    assert(plugin != NULL);
+    assert(mesh_data_count >= 0);
+    assert(mesh_data_list != NULL);
+
+    for (i = 0; i < mesh_data_count; i++) {
+        total_num_vertices += mesh_data_list[i].num_vertices;
         total_num_triangles += mesh_data_list[i].num_triangles;
+    }
 
-    if (total_num_triangles > plugin->mesh_buffers_max_triangles) {
-        /* Current buffer not big enough, free old buffers first */
+    if (total_num_vertices > plugin->vertex_buffer_capacity) {
+        /* Current buffer not big enough, free old buffer first */
         if (plugin->vertex_buffer) {
             clReleaseMemObject(plugin->vertex_buffer);
             plugin->vertex_buffer = NULL;
         }
-        if (plugin->triangles_buffer) {
-            clReleaseMemObject(plugin->triangles_buffer);
-            plugin->triangles_buffer = NULL;
-        }
 
-        plugin->mesh_buffers_max_triangles = 0;
+        plugin->vertex_buffer_capacity = 0;
 
         /* TODO: Maybe better dynamic resizing (factor = 1.5)? */
         new_vertex_buffer =
-        clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
-                       sizeof(cl_int) * total_num_triangles, NULL, &err);
-        CHECK_CL_ERROR(err);
-
-        new_triangles_buffer =
             clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
-                           sizeof(float) * 3 * total_num_triangles, NULL, &err);
+                           sizeof(float) * 3 * total_num_vertices, NULL, &err);
         CHECK_CL_ERROR(err);
 
-        plugin->mesh_buffers_max_triangles = total_num_triangles;
+        plugin->vertex_buffer_capacity = total_num_vertices;
         plugin->vertex_buffer = new_vertex_buffer;
-        plugin->triangles_buffer = new_triangles_buffer;
-        new_vertex_buffer = new_triangles_buffer = NULL;
+        new_vertex_buffer = NULL;
     }
 
+    if (total_num_triangles > plugin->triangle_buffer_capacity) {
+        /* Current buffer not big enough, free old buffer first */
+        if (plugin->triangle_buffer) {
+            clReleaseMemObject(plugin->triangle_buffer);
+            plugin->triangle_buffer = NULL;
+        }
+
+        plugin->triangle_buffer_capacity = 0;
+
+        /* TODO: Maybe better dynamic resizing (factor = 1.5)? */
+        new_triangle_buffer =
+            clCreateBuffer(plugin->context, CL_MEM_READ_ONLY,
+                           sizeof(cl_int) * 3 * total_num_triangles, NULL, &err);
+        CHECK_CL_ERROR(err);
+
+        plugin->triangle_buffer_capacity = total_num_triangles;
+        plugin->triangle_buffer = new_triangle_buffer;
+        new_triangle_buffer = NULL;
+    }
+
+    total_num_vertices = 0;
     total_num_triangles = 0;
     for (i = 0; i < mesh_data_count; i++) {
         mesh_data *mesh_data = &mesh_data_list[i];
 
         err = clEnqueueWriteBuffer(
-            plugin->queue, new_vertex_buffer, CL_FALSE,
-            total_num_triangles * sizeof(float) * 3,
-            mesh_data->num_triangles * sizeof(float) * 3, mesh_data->verticies,
+            plugin->queue, plugin->vertex_buffer, CL_FALSE,
+            sizeof(float) * 3 * total_num_vertices,
+            sizeof(float) * 3 * mesh_data->num_vertices, mesh_data->vertices,
             0, NULL, NULL);
         CHECK_CL_ERROR(err);
 
         err = clEnqueueWriteBuffer(
-            plugin->queue, new_triangles_buffer, CL_FALSE,
-            total_num_triangles * sizeof(cl_int),
-            mesh_data->num_triangles * sizeof(cl_int), mesh_data->triangles,
+            plugin->queue, plugin->triangle_buffer, CL_FALSE,
+            sizeof(cl_int) * 3 * total_num_triangles,
+            sizeof(cl_int) * 3 * mesh_data->num_triangles, mesh_data->triangles,
             0, NULL, NULL);
         CHECK_CL_ERROR(err);
 
+        total_num_vertices += mesh_data_list[i].num_vertices;
         total_num_triangles += mesh_data_list[i].num_triangles;
     }
 
     /* Wait for all buffer writes to finish, TODO: investigate this further */
-    clFinish(plugin->queue);
+    err = clFinish(plugin->queue);
+    CHECK_CL_ERROR(err);
 
     return 0;
 error:
     if (new_vertex_buffer)
         clReleaseMemObject(new_vertex_buffer);
-    if (new_triangles_buffer)
-        clReleaseMemObject(new_triangles_buffer);
+    if (new_triangle_buffer)
+        clReleaseMemObject(new_triangle_buffer);
     return -1;
 }
 
@@ -512,6 +530,7 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     cl_int next_row_offset, next_slice_offset;
     size_t local_work_size;
 
+    assert(plugin != NULL);
     assert(inv_element_size >= 0);
     assert(x_cell_length >= 0);
     assert(y_cell_length >= 0);
@@ -531,10 +550,13 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
                             0, NULL, NULL, &err))
         goto error;
 
+    err = clFinish(plugin->queue);
+    CHECK_CL_ERROR(err);
+
     next_row_offset = x_cell_length;
     next_slice_offset = x_cell_length * y_cell_length;
 
-    err |= clSetKernelArg(plugin->voxelize_kernel, 0, sizeof(cl_mem), &plugin->voxel_grid_buffer_size);
+    err |= clSetKernelArg(plugin->voxelize_kernel, 0, sizeof(cl_mem), &plugin->voxel_grid_buffer);
     err |= clSetKernelArg(plugin->voxelize_kernel, 1, sizeof(float),  &inv_element_size);
     err |= clSetKernelArg(plugin->voxelize_kernel, 2, sizeof(float),  &corner_x);
     err |= clSetKernelArg(plugin->voxelize_kernel, 3, sizeof(float),  &corner_y);
@@ -548,10 +570,13 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
 
     for (i = 0; i < mesh_data_count; i++) {
         size_t global_work_size;
+        cl_uint vertex_buffer_base_idx = mesh_data_list[i].vertex_buffer_base_idx;
+        cl_uint triangle_buffer_base_idx = mesh_data_list[i].triangle_buffer_base_idx;
         err |= clSetKernelArg(plugin->voxelize_kernel, 10, sizeof(cl_mem), &plugin->vertex_buffer);
-        err |= clSetKernelArg(plugin->voxelize_kernel, 11, sizeof(cl_mem), &plugin->triangles_buffer);
+        err |= clSetKernelArg(plugin->voxelize_kernel, 11, sizeof(cl_mem), &plugin->triangle_buffer);
         err |= clSetKernelArg(plugin->voxelize_kernel, 12, sizeof(cl_int), &mesh_data_list[i].num_triangles);
-        err |= clSetKernelArg(plugin->voxelize_kernel, 13, sizeof(size_t), &mesh_data_list[i].buffer_offset);
+        err |= clSetKernelArg(plugin->voxelize_kernel, 13, sizeof(cl_uint), &vertex_buffer_base_idx);
+        err |= clSetKernelArg(plugin->voxelize_kernel, 14, sizeof(cl_uint), &triangle_buffer_base_idx);
         CHECK_CL_ERROR(err);
 
         /* As per the OpenCL spec, global_work_size must divide evenly by
@@ -563,7 +588,13 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
 
         err = clEnqueueNDRangeKernel(plugin->queue, plugin->voxelize_kernel, 1, NULL, &global_work_size, &local_work_size, 0, NULL, NULL);
         CHECK_CL_ERROR(err);
+
+        err = clFinish(plugin->queue);
+        CHECK_CL_ERROR(err);
     }
+
+    err = clFinish(plugin->queue);
+    CHECK_CL_ERROR(err);
 
     err = clEnqueueReadBuffer(
         plugin->queue, plugin->voxel_grid_buffer, CL_TRUE, 0,
@@ -589,8 +620,8 @@ void opencl_plugin_destroy(opencl_plugin plugin)
         clReleaseMemObject(plugin->voxel_grid_buffer);
     if (plugin->vertex_buffer)
         clReleaseMemObject(plugin->vertex_buffer);
-    if (plugin->triangles_buffer)
-        clReleaseMemObject(plugin->triangles_buffer);
+    if (plugin->triangle_buffer)
+        clReleaseMemObject(plugin->triangle_buffer);
 
     free(plugin);
 }
