@@ -25,7 +25,7 @@ else()
 endif()
 
 set(SOURCES
-  main.c
+  plugin.c
 )
 
 add_library(opencl_experiments SHARED ${SOURCES})
