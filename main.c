@@ -107,7 +107,7 @@ typedef struct _opencl_plugin
     cl_kernel        voxelize_kernel;
 
     cl_mem           voxel_grid_buffer;
-    size_t           voxel_grid_buffer_size;
+    size_t           voxel_grid_buffer_capacity;
 
     cl_mem           vertex_buffer;
     cl_mem           triangle_buffer;
@@ -393,35 +393,45 @@ error:
     return -1;
 }
 
-cl_int opencl_plugin_set_num_voxels(opencl_plugin plugin,
-                                    cl_int num_voxels)
+static cl_int opencl_plugin_init_voxel_buffer(opencl_plugin plugin,
+                                              cl_int num_voxels)
 {
     cl_int err;
-    cl_mem buffer = NULL;
+    cl_mem new_voxel_buffer = NULL;
 
     assert(plugin != NULL);
+    assert(num_voxels >= 0);
 
-    /* TODO: Maybe do other way around? */
-    buffer = clCreateBuffer(plugin->context, CL_MEM_WRITE_ONLY, (size_t)num_voxels, NULL, &err);
-    CHECK_CL_ERROR(err);
+    if ((size_t)num_voxels > plugin->voxel_grid_buffer_capacity) {
+        /* Current buffer not big enough, free old buffer first */
+        if (plugin->voxel_grid_buffer) {
+            clReleaseMemObject(plugin->voxel_grid_buffer);
+            plugin->voxel_grid_buffer = NULL;
+        }
 
-    /* Make sure all commands are finished before freeing the old mem object */
-    clFinish(plugin->queue);
-    if (plugin->voxel_grid_buffer)
-        clReleaseMemObject(plugin->voxel_grid_buffer);
+        plugin->voxel_grid_buffer_capacity = 0;
 
-    plugin->voxel_grid_buffer = buffer;
-    plugin->voxel_grid_buffer_size = (size_t)num_voxels;
+        /* TODO: Maybe better dynamic resizing (factor = 1.5)? */
+        new_voxel_buffer =
+            clCreateBuffer(plugin->context, CL_MEM_WRITE_ONLY,
+                           (size_t)num_voxels, NULL, &err);
+        CHECK_CL_ERROR(err);
+
+        plugin->voxel_grid_buffer_capacity = (size_t)num_voxels;
+        plugin->voxel_grid_buffer = new_voxel_buffer;
+        new_voxel_buffer = NULL;
+    }
+
     return 0;
 error:
-    if (buffer)
-        clReleaseMemObject(buffer);
+    if (new_voxel_buffer)
+        clReleaseMemObject(new_voxel_buffer);
     return -1;
 }
 
-static cl_int opencl_plugin_init_buffers(opencl_plugin plugin,
-                                         cl_int mesh_data_count,
-                                         mesh_data *mesh_data_list)
+static cl_int opencl_plugin_init_mesh_buffers(opencl_plugin plugin,
+                                              cl_int mesh_data_count,
+                                              mesh_data *mesh_data_list)
 {
     cl_int err;
     cl_int i;
@@ -529,6 +539,7 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     cl_int i;
     cl_int next_row_offset, next_slice_offset;
     size_t local_work_size;
+    cl_int num_voxels;
 
     assert(plugin != NULL);
     assert(inv_element_size >= 0);
@@ -538,7 +549,13 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     assert(mesh_data_count >= 0);
     assert(mesh_data_list != NULL);
 
-    if (opencl_plugin_init_buffers(plugin, mesh_data_count, mesh_data_list))
+    /* (Re-)allocate buffer for voxel grid */
+    num_voxels = x_cell_length * y_cell_length * z_cell_length;
+    if (opencl_plugin_init_voxel_buffer(plugin, num_voxels))
+        goto error;
+
+    /* (Re-)allocate buffers for mesh data */
+    if (opencl_plugin_init_mesh_buffers(plugin, mesh_data_count, mesh_data_list))
         goto error;
 
     err = clGetKernelWorkGroupInfo(
@@ -546,7 +563,7 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
         CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &local_work_size, NULL);
     CHECK_CL_ERROR(err);
 
-    if (enqueue_zero_buffer(plugin->queue, plugin->voxel_grid_buffer, plugin->voxel_grid_buffer_size,
+    if (enqueue_zero_buffer(plugin->queue, plugin->voxel_grid_buffer, plugin->voxel_grid_buffer_capacity,
                             0, NULL, NULL, &err))
         goto error;
 
@@ -598,7 +615,7 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
 
     err = clEnqueueReadBuffer(
         plugin->queue, plugin->voxel_grid_buffer, CL_TRUE, 0,
-        plugin->voxel_grid_buffer_size, voxel_grid_out, 0, NULL, NULL);
+        num_voxels, voxel_grid_out, 0, NULL, NULL);
     CHECK_CL_ERROR(err);
 
     return 0;
