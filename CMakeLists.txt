@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.9)
+cmake_minimum_required(VERSION 2.8.11)
 
 project(opencl_experiments)
 
@@ -29,6 +29,8 @@ set(SOURCES
 )
 
 add_library(opencl_experiments SHARED ${SOURCES})
+set_target_properties(opencl_experiments PROPERTIES C_VISIBILITY_PRESET hidden)
+target_include_directories(opencl_experiments PUBLIC ${CMAKE_BINARY_DIR})
 target_link_libraries(opencl_experiments ${OPENCL_LIBRARIES})
 
 include(GenerateExportHeader)

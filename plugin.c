@@ -9,16 +9,98 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <CL/cl.h>
+
+#include <opencl_experiments_export.h>
 
 typedef void (*debug_print_handler)(const char *, cl_int, const char *);
 
 debug_print_handler g_debug_print_handler = NULL;
 
+OPENCL_EXPERIMENTS_EXPORT
 void init_debug_print_handler(debug_print_handler func)
 {
     g_debug_print_handler = func;
+}
+
+#define CL_ERROR_CASE(err) case err: return #err
+
+static const char *get_cl_error_string(cl_int err)
+{
+    switch (err) {
+        CL_ERROR_CASE(CL_SUCCESS);
+        CL_ERROR_CASE(CL_DEVICE_NOT_FOUND);
+        CL_ERROR_CASE(CL_DEVICE_NOT_AVAILABLE);
+        CL_ERROR_CASE(CL_COMPILER_NOT_AVAILABLE);
+        CL_ERROR_CASE(CL_MEM_OBJECT_ALLOCATION_FAILURE);
+        CL_ERROR_CASE(CL_OUT_OF_RESOURCES);
+        CL_ERROR_CASE(CL_OUT_OF_HOST_MEMORY);
+        CL_ERROR_CASE(CL_PROFILING_INFO_NOT_AVAILABLE);
+        CL_ERROR_CASE(CL_MEM_COPY_OVERLAP);
+        CL_ERROR_CASE(CL_IMAGE_FORMAT_MISMATCH);
+        CL_ERROR_CASE(CL_IMAGE_FORMAT_NOT_SUPPORTED);
+        CL_ERROR_CASE(CL_BUILD_PROGRAM_FAILURE);
+        CL_ERROR_CASE(CL_MAP_FAILURE);
+        CL_ERROR_CASE(CL_MISALIGNED_SUB_BUFFER_OFFSET);
+        CL_ERROR_CASE(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+#ifdef CL_VERSION_1_2
+        CL_ERROR_CASE(CL_COMPILE_PROGRAM_FAILURE);
+        CL_ERROR_CASE(CL_LINKER_NOT_AVAILABLE);
+        CL_ERROR_CASE(CL_LINK_PROGRAM_FAILURE);
+        CL_ERROR_CASE(CL_DEVICE_PARTITION_FAILED);
+        CL_ERROR_CASE(CL_KERNEL_ARG_INFO_NOT_AVAILABLE);
+#endif
+
+        CL_ERROR_CASE(CL_INVALID_VALUE);
+        CL_ERROR_CASE(CL_INVALID_DEVICE_TYPE);
+        CL_ERROR_CASE(CL_INVALID_PLATFORM);
+        CL_ERROR_CASE(CL_INVALID_DEVICE);
+        CL_ERROR_CASE(CL_INVALID_CONTEXT);
+        CL_ERROR_CASE(CL_INVALID_QUEUE_PROPERTIES);
+        CL_ERROR_CASE(CL_INVALID_COMMAND_QUEUE);
+        CL_ERROR_CASE(CL_INVALID_HOST_PTR);
+        CL_ERROR_CASE(CL_INVALID_MEM_OBJECT);
+        CL_ERROR_CASE(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR);
+        CL_ERROR_CASE(CL_INVALID_IMAGE_SIZE);
+        CL_ERROR_CASE(CL_INVALID_SAMPLER);
+        CL_ERROR_CASE(CL_INVALID_BINARY);
+        CL_ERROR_CASE(CL_INVALID_BUILD_OPTIONS);
+        CL_ERROR_CASE(CL_INVALID_PROGRAM);
+        CL_ERROR_CASE(CL_INVALID_PROGRAM_EXECUTABLE);
+        CL_ERROR_CASE(CL_INVALID_KERNEL_NAME);
+        CL_ERROR_CASE(CL_INVALID_KERNEL_DEFINITION);
+        CL_ERROR_CASE(CL_INVALID_KERNEL);
+        CL_ERROR_CASE(CL_INVALID_ARG_INDEX);
+        CL_ERROR_CASE(CL_INVALID_ARG_VALUE);
+        CL_ERROR_CASE(CL_INVALID_ARG_SIZE);
+        CL_ERROR_CASE(CL_INVALID_KERNEL_ARGS);
+        CL_ERROR_CASE(CL_INVALID_WORK_DIMENSION);
+        CL_ERROR_CASE(CL_INVALID_WORK_GROUP_SIZE);
+        CL_ERROR_CASE(CL_INVALID_WORK_ITEM_SIZE);
+        CL_ERROR_CASE(CL_INVALID_GLOBAL_OFFSET);
+        CL_ERROR_CASE(CL_INVALID_EVENT_WAIT_LIST);
+        CL_ERROR_CASE(CL_INVALID_EVENT);
+        CL_ERROR_CASE(CL_INVALID_OPERATION);
+        CL_ERROR_CASE(CL_INVALID_GL_OBJECT);
+        CL_ERROR_CASE(CL_INVALID_BUFFER_SIZE);
+        CL_ERROR_CASE(CL_INVALID_MIP_LEVEL);
+        CL_ERROR_CASE(CL_INVALID_GLOBAL_WORK_SIZE);
+#ifdef CL_VERSION_1_2
+        CL_ERROR_CASE(CL_INVALID_PROPERTY);
+        CL_ERROR_CASE(CL_INVALID_IMAGE_DESCRIPTOR);
+        CL_ERROR_CASE(CL_INVALID_COMPILER_OPTIONS);
+        CL_ERROR_CASE(CL_INVALID_LINKER_OPTIONS);
+        CL_ERROR_CASE(CL_INVALID_DEVICE_PARTITION_COUNT);
+#endif
+#ifdef CL_VERSION_2_0
+        CL_ERROR_CASE(CL_INVALID_PIPE_SIZE);
+        CL_ERROR_CASE(CL_INVALID_DEVICE_QUEUE);
+#endif
+    /* OpenCL extension errors not included */
+    default: return "Unknown OpenCL error";
+    }
 }
 
 static void debug_printf(const char *fmt,
@@ -55,8 +137,8 @@ static void debug_printf(const char *fmt,
 #define CHECK_CL_ERROR(err)                                             \
     do {                                                                \
         if (DEBUG && err != CL_SUCCESS) {                               \
-            debug_printf("Error: OpenCL returned error %d",             \
-                         __FILE__, __LINE__, err);                      \
+            debug_printf("Error: OpenCL returned %s",                   \
+                         __FILE__, __LINE__, get_cl_error_string(err)); \
             goto error;                                                 \
         }                                                               \
     } while(0)
@@ -64,8 +146,9 @@ static void debug_printf(const char *fmt,
 #define CHECK_CL_ERROR_MSG(err, fmt, ...)                               \
     do {                                                                \
         if (DEBUG && err != CL_SUCCESS) {                               \
-            debug_printf("Error: " fmt " (OpenCL returned error %d)",   \
-                         __FILE__, __LINE__, __VA_ARGS__, err);         \
+            debug_printf("Error: " fmt " (OpenCL returned %s)",         \
+                         __FILE__, __LINE__, __VA_ARGS__,               \
+                         get_cl_error_string(err));                     \
             goto error;                                                 \
         }                                                               \
     } while(0)
@@ -347,6 +430,7 @@ error:
     return -1;
 }
 
+OPENCL_EXPERIMENTS_EXPORT
 cl_int opencl_plugin_create(opencl_plugin *plugin_out)
 {
     cl_int err = CL_SUCCESS;
@@ -523,6 +607,7 @@ error:
     return -1;
 }
 
+OPENCL_EXPERIMENTS_EXPORT
 cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
                                      float inv_element_size,
                                      float corner_x,
@@ -541,6 +626,10 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     size_t local_work_size;
     cl_int num_voxels;
 
+    clock_t t1;
+    clock_t t2;
+    clock_t t3;
+
     assert(plugin != NULL);
     assert(inv_element_size >= 0);
     assert(x_cell_length >= 0);
@@ -548,6 +637,8 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     assert(z_cell_length >= 0);
     assert(mesh_data_count >= 0);
     assert(mesh_data_list != NULL);
+
+    t1 = clock();
 
     /* (Re-)allocate buffer for voxel grid */
     num_voxels = x_cell_length * y_cell_length * z_cell_length;
@@ -569,6 +660,9 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
 
     err = clFinish(plugin->queue);
     CHECK_CL_ERROR(err);
+
+    t1 = clock() - t1;
+    t2 = clock();
 
     next_row_offset = x_cell_length;
     next_slice_offset = x_cell_length * y_cell_length;
@@ -613,16 +707,25 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
     err = clFinish(plugin->queue);
     CHECK_CL_ERROR(err);
 
+    t2 = clock() - t2;
+    t3 = clock();
+
     err = clEnqueueReadBuffer(
         plugin->queue, plugin->voxel_grid_buffer, CL_TRUE, 0,
         num_voxels, voxel_grid_out, 0, NULL, NULL);
     CHECK_CL_ERROR(err);
 
+    t3 = clock() - t3;
+
+    TRACE("Clock T1: %f", ((float)t1 * 1000.0f) / CLOCKS_PER_SEC);
+    TRACE("Clock T2: %f", ((float)t2 * 1000.0f) / CLOCKS_PER_SEC);
+    TRACE("Clock T3: %f", ((float)t3 * 1000.0f) / CLOCKS_PER_SEC);
     return 0;
 error:
     return -1;
 }
 
+OPENCL_EXPERIMENTS_EXPORT
 void opencl_plugin_destroy(opencl_plugin plugin)
 {
     if (!plugin) return;
