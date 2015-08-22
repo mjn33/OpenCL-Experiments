@@ -15,7 +15,14 @@
 
 #include <opencl_experiments_export.h>
 
-typedef void (*debug_print_handler)(const char *, cl_int, const char *);
+enum logging_msg_type
+{
+    LOGGING_MSG_TRACE,
+    LOGGING_MSG_WARNING,
+    LOGGING_MSG_ERROR
+};
+
+typedef void (*debug_print_handler)(const char *, cl_int, cl_int, const char *);
 
 debug_print_handler g_debug_print_handler = NULL;
 
@@ -106,6 +113,7 @@ static const char *get_cl_error_string(cl_int err)
 static void debug_printf(const char *fmt,
                          const char *filename,
                          int line,
+                         int msg_type,
                          ...)
 {
     char buf[4096];
@@ -113,32 +121,33 @@ static void debug_printf(const char *fmt,
     size_t len;
     va_list ap;
 
-    va_start (ap, line);
+    va_start (ap, msg_type);
     len = vsnprintf(buf, 4096, fmt, ap);
     va_end(ap);
     if (len > 4095) {
         /* Large output, allocate heap buffer */
         heap_buf = malloc(sizeof(*heap_buf) * (len + 1));
         if (!heap_buf)
-            g_debug_print_handler(filename, line, buf); /* Bail */
+            g_debug_print_handler(filename, line, msg_type, buf); /* Bail */
         else {
-            va_start (ap, line);
+            va_start (ap, msg_type);
             len = vsnprintf(heap_buf, len + 1, fmt, ap);
             va_end(ap);
 
-            g_debug_print_handler(filename, line, heap_buf);
+            g_debug_print_handler(filename, line, msg_type, heap_buf);
         }
         free(heap_buf);
     }
     else
-        g_debug_print_handler(filename, line, buf);
+        g_debug_print_handler(filename, line, msg_type, buf);
 }
 
 #define CHECK_CL_ERROR(err)                                             \
     do {                                                                \
         if (DEBUG && err != CL_SUCCESS) {                               \
-            debug_printf("Error: OpenCL returned %s",                   \
-                         __FILE__, __LINE__, get_cl_error_string(err)); \
+            debug_printf("OpenCL returned %s",                          \
+                         __FILE__, __LINE__, LOGGING_MSG_ERROR,         \
+                         get_cl_error_string(err));                     \
             goto error;                                                 \
         }                                                               \
     } while(0)
@@ -146,9 +155,9 @@ static void debug_printf(const char *fmt,
 #define CHECK_CL_ERROR_MSG(err, fmt, ...)                               \
     do {                                                                \
         if (DEBUG && err != CL_SUCCESS) {                               \
-            debug_printf("Error: " fmt " (OpenCL returned %s)",         \
-                         __FILE__, __LINE__, __VA_ARGS__,               \
-                         get_cl_error_string(err));                     \
+            debug_printf(fmt " (OpenCL returned %s)",                   \
+                         __FILE__, __LINE__, LOGGING_MSG_ERROR,         \
+                         __VA_ARGS__,   get_cl_error_string(err));      \
             goto error;                                                 \
         }                                                               \
     } while(0)
@@ -156,27 +165,27 @@ static void debug_printf(const char *fmt,
 #define CHECK_ALLOCATION(ptr)                                           \
     do {                                                                \
         if (!ptr) {                                                     \
-            debug_printf("Error: Memory allocation failure",            \
-                         __FILE__, __LINE__);                           \
+            debug_printf("Memory allocation failure",                   \
+                         __FILE__, __LINE__, LOGGING_MSG_ERROR);        \
             goto error;                                                 \
         }                                                               \
     } while(0)
 
 #define TRACE(fmt, ...)                                                 \
     do {                                                                \
-        debug_printf("Trace: " fmt, __FILE__, __LINE__,                 \
+        debug_printf(fmt, __FILE__, __LINE__, LOGGING_MSG_TRACE,        \
                      __VA_ARGS__);                                      \
     } while(0)
 
 #define WARNING(fmt, ...)                                               \
     do {                                                                \
-        debug_printf("Warning: " fmt, __FILE__, __LINE__,               \
+        debug_printf(fmt, __FILE__, __LINE__, LOGGING_MSG_WARNING,      \
                      __VA_ARGS__);                                      \
     } while(0)
 
 #define ERROR(fmt, ...)                                                 \
     do {                                                                \
-        debug_printf("Error: " fmt, __FILE__, __LINE__,                 \
+        debug_printf(fmt, __FILE__, __LINE__, LOGGING_MSG_ERROR,        \
                      __VA_ARGS__);                                      \
     } while(0)
 
@@ -186,6 +195,8 @@ typedef struct _opencl_plugin
     cl_device_id     selected_device;
     cl_context       context;
     cl_command_queue queue;
+    int              num_queues;
+    cl_command_queue *queues;
     cl_program       program;
     cl_kernel        voxelize_kernel;
 
@@ -390,8 +401,8 @@ static int build_program_from_file(const char *filename,
         else
             ERROR("Failed to build program in file \"%s\"", filename);
 
-        debug_printf("================================== BUILD LOG ===================================", NULL, 0);
-        debug_printf("%s", NULL, 0, build_log);
+        debug_printf("================================== BUILD LOG ===================================\n"
+                     "%s", NULL, 0, LOGGING_MSG_ERROR, build_log);
         goto error;
     }
     CHECK_CL_ERROR(*err);
@@ -435,6 +446,8 @@ cl_int opencl_plugin_create(opencl_plugin *plugin_out)
 {
     cl_int err = CL_SUCCESS;
     opencl_plugin plugin;
+    int i;
+    int num_queues = 50;
 
     assert(plugin_out != NULL);
 
@@ -459,6 +472,15 @@ cl_int opencl_plugin_create(opencl_plugin *plugin_out)
     plugin->queue = clCreateCommandQueue(plugin->context, plugin->selected_device, 0, &err);
     CHECK_CL_ERROR(err);
 
+    plugin->num_queues = num_queues;
+    plugin->queues = calloc(num_queues, sizeof(cl_command_queue));
+    CHECK_ALLOCATION(plugin->queues);
+
+    for (i = 0; i < num_queues; i++) {
+        plugin->queues[i] = clCreateCommandQueue(plugin->context, plugin->selected_device, 0, &err);
+        CHECK_CL_ERROR(err);
+    }
+
     plugin->voxelize_kernel = clCreateKernel(plugin->program, "voxelize", &err);
     CHECK_CL_ERROR(err);
 
@@ -470,6 +492,13 @@ error:
             clReleaseKernel(plugin->voxelize_kernel);
         if (plugin->queue)
             clReleaseCommandQueue(plugin->queue);
+        if (plugin->queues) {
+            for (i = 0; i < num_queues; i++) {
+                if (plugin->queues[i])
+                    clReleaseCommandQueue(plugin->queues[i]);
+            }
+            free(plugin->queues);
+        }
         if (plugin->context)
             clReleaseContext(plugin->context);
         free(plugin);
@@ -697,15 +726,24 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
         if (global_work_size < (size_t)mesh_data_list[i].num_triangles)
             global_work_size += local_work_size;
 
-        err = clEnqueueNDRangeKernel(plugin->queue, plugin->voxelize_kernel, 1, NULL, &global_work_size, &local_work_size, 0, NULL, NULL);
-        CHECK_CL_ERROR(err);
+        err = clEnqueueNDRangeKernel(
+            plugin->queues[i % plugin->num_queues], plugin->voxelize_kernel, 1, NULL, &global_work_size,
+            &local_work_size, 0, NULL, NULL);
+        CHECK_CL_ERROR_MSG(err, "clEnqueueNDRangeKernel failed on mesh %d/%d",
+                           i + 1, mesh_data_count);
 
         err = clFinish(plugin->queue);
-        CHECK_CL_ERROR(err);
+        CHECK_CL_ERROR_MSG(err, "clFinish failed on mesh %d/%d",
+                           i + 1, mesh_data_count);
     }
 
     err = clFinish(plugin->queue);
     CHECK_CL_ERROR(err);
+
+    for (i = 0; i < plugin->num_queues; i++) {
+        err = clFinish(plugin->queues[i]);
+        CHECK_CL_ERROR(err);
+    }
 
     t2 = clock() - t2;
     t3 = clock();
