@@ -1,10 +1,15 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/*
+ * Copyright (C) 2015, Matthew J. Nicholls
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
 
 #define DEBUG 1
 
 #include <assert.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +20,7 @@
 
 #include <opencl_experiments_export.h>
 
-enum logging_msg_type
-{
+enum logging_msg_type {
     LOGGING_MSG_TRACE,
     LOGGING_MSG_WARNING,
     LOGGING_MSG_ERROR
@@ -137,8 +141,7 @@ static void debug_printf(const char *fmt,
             g_debug_print_handler(filename, line, msg_type, heap_buf);
         }
         free(heap_buf);
-    }
-    else
+    } else
         g_debug_print_handler(filename, line, msg_type, buf);
 }
 
@@ -189,34 +192,37 @@ static void debug_printf(const char *fmt,
                      __VA_ARGS__);                                      \
     } while(0)
 
-typedef struct _opencl_plugin
-{
+typedef struct _opencl_plugin {
     cl_platform_id   selected_platform;
     cl_device_id     selected_device;
     cl_context       context;
     cl_command_queue queue;
-    int              num_queues;
+    cl_int           num_queues;
     cl_command_queue *queues;
     cl_program       program;
     cl_kernel        voxelize_kernel;
 
     cl_mem           voxel_grid_buffer;
-    size_t           voxel_grid_buffer_capacity;
+    /* Mostly using cl_int as opposed to size_t, as interop with .NET
+     * means we're limited to Int32 for indexing */
+    cl_int           voxel_grid_buffer_capacity;
 
     cl_mem           vertex_buffer;
     cl_mem           triangle_buffer;
-    size_t           vertex_buffer_capacity;
-    size_t           triangle_buffer_capacity;
+    cl_int           vertex_buffer_capacity;
+    cl_int           triangle_buffer_capacity;
 } *opencl_plugin;
 
-typedef struct _mesh_data
-{
+typedef struct _mesh_data {
     float  *vertices;
     cl_int num_vertices;
     cl_int *triangles;
     cl_int num_triangles;
-    size_t triangle_buffer_base_idx;
-    size_t vertex_buffer_base_idx;
+    cl_int triangle_buffer_base_idx;
+    cl_int vertex_buffer_base_idx;
+    cl_int part_idx;
+    float  bounds_min_x, bounds_min_y, bounds_min_z;
+    float  bounds_max_x, bounds_max_y, bounds_max_z;
 } mesh_data;
 
 static int get_desired_platform(const char *substr,
@@ -294,8 +300,7 @@ static int get_gpu_device_id(cl_platform_id platform_id,
     if (*err == CL_DEVICE_NOT_FOUND && !fallback) {
         ERROR("No GPU devices found", 0);
         goto error;
-    }
-    else if (*err != CL_DEVICE_NOT_FOUND) {
+    } else if (*err != CL_DEVICE_NOT_FOUND) {
         CHECK_CL_ERROR(*err);
         return 0;
     }
@@ -446,8 +451,8 @@ cl_int opencl_plugin_create(opencl_plugin *plugin_out)
 {
     cl_int err = CL_SUCCESS;
     opencl_plugin plugin;
-    int i;
-    int num_queues = 50;
+    cl_int i;
+    cl_int num_queues = 50;
 
     assert(plugin_out != NULL);
 
@@ -515,7 +520,7 @@ static cl_int opencl_plugin_init_voxel_buffer(opencl_plugin plugin,
     assert(plugin != NULL);
     assert(num_voxels >= 0);
 
-    if ((size_t)num_voxels > plugin->voxel_grid_buffer_capacity) {
+    if (num_voxels > plugin->voxel_grid_buffer_capacity) {
         /* Current buffer not big enough, free old buffer first */
         if (plugin->voxel_grid_buffer) {
             clReleaseMemObject(plugin->voxel_grid_buffer);
@@ -530,7 +535,7 @@ static cl_int opencl_plugin_init_voxel_buffer(opencl_plugin plugin,
                            (size_t)num_voxels, NULL, &err);
         CHECK_CL_ERROR(err);
 
-        plugin->voxel_grid_buffer_capacity = (size_t)num_voxels;
+        plugin->voxel_grid_buffer_capacity = num_voxels;
         plugin->voxel_grid_buffer = new_voxel_buffer;
         new_voxel_buffer = NULL;
     }
@@ -549,7 +554,7 @@ static cl_int opencl_plugin_init_mesh_buffers(opencl_plugin plugin,
     cl_int err;
     cl_int i;
     cl_mem new_vertex_buffer = NULL, new_triangle_buffer = NULL;
-    size_t total_num_vertices = 0, total_num_triangles = 0;
+    cl_int total_num_vertices = 0, total_num_triangles = 0;
 
     assert(plugin != NULL);
     assert(mesh_data_count >= 0);
@@ -680,11 +685,13 @@ cl_int opencl_plugin_voxelize_meshes(opencl_plugin plugin,
 
     err = clGetKernelWorkGroupInfo(
         plugin->voxelize_kernel, plugin->selected_device,
-        CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &local_work_size, NULL);
+        CL_KERNEL_WORK_GROUP_SIZE, sizeof(local_work_size), &local_work_size,
+        NULL);
     CHECK_CL_ERROR(err);
 
-    if (enqueue_zero_buffer(plugin->queue, plugin->voxel_grid_buffer, plugin->voxel_grid_buffer_capacity,
-                            0, NULL, NULL, &err))
+    if (enqueue_zero_buffer(plugin->queue, plugin->voxel_grid_buffer,
+                            plugin->voxel_grid_buffer_capacity, 0, NULL, NULL,
+                            &err))
         goto error;
 
     err = clFinish(plugin->queue);
@@ -766,12 +773,20 @@ error:
 OPENCL_EXPERIMENTS_EXPORT
 void opencl_plugin_destroy(opencl_plugin plugin)
 {
+    cl_int i = 0;
     if (!plugin) return;
 
     if (plugin->voxelize_kernel)
         clReleaseKernel(plugin->voxelize_kernel);
     if (plugin->queue)
         clReleaseCommandQueue(plugin->queue);
+    if (plugin->queues) {
+        for (i = 0; i < plugin->num_queues; i++) {
+            if (plugin->queues[i])
+                clReleaseCommandQueue(plugin->queues[i]);
+        }
+        free(plugin->queues);
+    }
     if (plugin->context)
         clReleaseContext(plugin->context);
     if (plugin->voxel_grid_buffer)
